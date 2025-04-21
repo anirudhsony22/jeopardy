@@ -1,0 +1,10 @@
+# Ignore macOS system file
+.DS_Store
+
+# Ignore text files
+README.txt
+questions.txt
+
+# Ignore folders
+database/
+wikidata/
