@@ -28,7 +28,7 @@ def ensure_chunks_exist(chunk_size, stride, base_dir='../database'):
 def embed_documents(chunk_dir, chunk_size, model_name='all-MiniLM-L6-v2', output_base='../database/'):
     if chunk_size==0:
         chunk_size = 'inf'
-    save_dir = os.path.join(output_base, str(chunk_size))
+    save_dir = os.path.join(output_base, str(chunk_size), model_name)
     os.makedirs(save_dir, exist_ok=True)
 
     save_dir = os.path.join(save_dir, "emb_chunks")
