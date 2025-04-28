@@ -7,3 +7,10 @@ combine_chunks.py - combines the data from embedded chunks (These chunks are dif
 faiss_vector_build.py  - builds the faiss vector for given embedded chunks
 
 query_test.py
+
+
+BGE Pre-filtering timings/recall (100 queries):
+10000 documents/query: 82s, Recall: 82%
+1000 documents/query: 47s, Recall: 80%
+
+

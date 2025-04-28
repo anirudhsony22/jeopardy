@@ -1,10 +1,10 @@
 import os
 import gc
 import pickle
-import pickle_utils
 import numpy as np
 from rank_bm25 import BM25Okapi
 import faiss
+import torch
 
 
 # Batch embed function - to avoid RAM overrun
@@ -52,7 +52,6 @@ def build_bm25_from_disk(tokenized_chunks_files):
     bm25 = BM25Okapi(corpus)
     return bm25
 
-import gc
 
 def tokenize_and_build_bm25(doc_ids, doc_contents, chunk_size, qutil):
     temp_files = []
@@ -76,7 +75,7 @@ def tokenize_and_build_bm25(doc_ids, doc_contents, chunk_size, qutil):
 
 
 ## Union Method
-def hybrid_search(query, bm25, bm25_doc_ids, faiss_index, retrieval_model, faiss_doc_ids, top_k=10):
+def union_hybrid_search(query, bm25, bm25_doc_ids, faiss_index, retrieval_model, faiss_doc_ids, top_k=10):
     """
     Run a hybrid BM25 + FAISS search for one query.
     Returns the list of retrieved doc IDs (in rank order).
@@ -101,8 +100,6 @@ def hybrid_search(query, bm25, bm25_doc_ids, faiss_index, retrieval_model, faiss
             hybrid.append(did)
     return hybrid
 
-
-## Evaluate Union Hybrid
 def evaluate_hybrid_end_to_end(
     bm25, 
     bm25_doc_ids,
@@ -126,7 +123,7 @@ def evaluate_hybrid_end_to_end(
     correct = 0
     mrr = 0
     for idx, qa in enumerate(qa_pairs, 1):
-        hits = hybrid_search(
+        hits = union_hybrid_search(
             qa["question"], 
             bm25, 
             bm25_doc_ids,
@@ -155,7 +152,7 @@ def evaluate_hybrid_end_to_end(
     return recall
 
 
-## Sequential Method
+## Sequential Method (BM25->FAISS)
 def sequential_hybrid_search(
     query: str,
     bm25,
@@ -188,15 +185,58 @@ def sequential_hybrid_search(
 
     return reranked[:top_k]
 
+## Smart sequential (FAISS->BM25)
+def smart_hybrid_search_restricted_optimized(
+    query,
+    faiss_index,
+    faiss_doc_ids,
+    retrieval_model,
+    doc_contents,
+    faiss_top_k=10000,
+    bm25_top_k=10
+):
+    """
+    Retrieve top-k documents using FAISS first,
+    then rerank the candidates using a temporary BM25 built on-the-fly.
+    """
 
-## Evaluate Sequential 
+    # --- Step 1: FAISS retrieval ---
+    q_emb = retrieval_model.encode([query], convert_to_numpy=True)
+    faiss.normalize_L2(q_emb)
+
+    print(q_emb.shape[1], faiss_index.d)
+
+    D, I = faiss_index.search(q_emb, faiss_top_k)
+    faiss_hits = [faiss_doc_ids[i] for i in I[0]]
+    
+    # --- Step 2: Tokenize FAISS hits ---
+    candidate_texts = [doc_contents[doc_id] for doc_id in faiss_hits]
+    tokenized_candidates = [text.lower().split() for text in candidate_texts]
+    
+    # --- Step 3: Build temporary BM25 ---
+    bm25_subset = BM25Okapi(tokenized_candidates)
+    
+    # --- Step 4: BM25 retrieval among candidates ---
+    tokenized_query = query.lower().split()
+    bm25_scores = bm25_subset.get_scores(tokenized_query)
+    top_idxs = np.argsort(bm25_scores)[::-1][:bm25_top_k]
+    reranked_hits = [faiss_hits[i] for i in top_idxs]
+
+    return reranked_hits
+
+## Evaluation for Sequential and Smart Sequential
 def evaluate_sequential_hybrid(
+    retrieval_model,
     bm25,
     bm25_doc_ids: list,
-    retrieval_model,
+    faiss_index,
     full_docs: dict,
+    faiss_doc_ids,
     questions_path: str,
-    top_k: int = 10
+    top_k: int = 10,
+    faiss_top_k=10000,
+    bm25_top_k=10,
+    faiss_first = True,
 ):
     """
     Load questions from questions.txt and evaluate Sequential Hybrid Retrieval.
@@ -218,12 +258,23 @@ def evaluate_sequential_hybrid(
 
     for idx, (category, question, answer) in enumerate(questions, start=1):
         query = f"{category} : {question}"
-        hits = sequential_hybrid_search(
-            query, bm25, bm25_doc_ids,
-            retrieval_model = retrieval_model, 
-            full_docs=full_docs,
-            top_k=top_k, 
-        )
+        if faiss_first:
+            hits = smart_hybrid_search_restricted_optimized(
+                    query,
+                    faiss_index,
+                    faiss_doc_ids,
+                    retrieval_model,
+                    full_docs,
+                    faiss_top_k=faiss_top_k,
+                    bm25_top_k=bm25_top_k
+                )
+        else:
+            hits = sequential_hybrid_search(
+                query, bm25, bm25_doc_ids,
+                retrieval_model = retrieval_model, 
+                full_docs=full_docs,
+                top_k=top_k, 
+            )
 
         # Match answer
         low_answer = answer.lower()
@@ -266,4 +317,156 @@ def evaluate_sequential_hybrid(
 
 
 
+## FAISS->Cross-Encoding
+def evaluate_sequential_encoding(
+    retrieval_model,
+    cross_encoder,
+    faiss_index,
+    docs_content: dict,
+    faiss_doc_ids,
+    questions_path: str,
+    top_k: int = 10,
+    faiss_top_k=1000,
+):
+    """
+    Load questions from questions.txt and evaluate Sequential Hybrid Retrieval.
+    Print detailed results and final summary.
+    """
+    # --- Load Questions ---
+    with open(questions_path, 'r', encoding='utf-8') as f:
+        lines = [line.strip() for line in f if line.strip()]
+    questions = []
+    for i in range(0, len(lines), 3):
+        category = lines[i]
+        question = lines[i+1]
+        answer = lines[i+2]
+        questions.append((category, question, answer))
 
+    # --- Evaluate ---
+    total, rr_list, correct_at_1, correct_at_k = len(questions), [], 0, 0
+    mrr = 0
+
+    for idx, (category, question, answer) in enumerate(questions, start=1):
+        query = f"{category} : {question}"
+        q_emb = retrieval_model.encode([query], convert_to_numpy=True)
+        faiss.normalize_L2(q_emb)
+        D, I = faiss_index.search(q_emb, faiss_top_k)
+        faiss_hits = [faiss_doc_ids[i] for i in I[0]]
+
+        hits = rerank_single_query_topk(query, faiss_hits, cross_encoder, docs_content, batch_size=32, top_k=top_k)
+
+        # Match answer
+        low_answer = answer.lower()
+        found_rank = None
+        for rank, doc_id in enumerate(hits, start=1):
+            if low_answer in docs_content[doc_id].lower():
+                found_rank = rank
+                break
+
+        # Collect stats
+        if found_rank == 1:
+            correct_at_1 += 1
+        if found_rank and found_rank <= top_k:
+            correct_at_k += 1
+            rr_list.append(1.0 / found_rank)
+            mrr += 1/found_rank
+            status = f"✅ Rank {found_rank}"
+        else:
+            rr_list.append(0.0)
+            status = "❌"
+
+        # Print per-question
+        print(f"    → Expected: {answer}")
+        print(f"{status} [{category}] Q: {question}")
+        print(f"MRR : {mrr}")
+        print()
+
+    # --- Final Metrics ---
+    mrr = sum(rr_list) / total
+    p_at_1 = correct_at_1 / total
+    recall_k = correct_at_k / total
+
+    print("―" * 60)
+    print(f"📊 MRR         : {mrr:.4f}")
+    print(f"📊 Precision@1 : {p_at_1:.4f}")
+    print(f"📊 Recall@{top_k}  : {recall_k:.4f} ({correct_at_k}/{total})")
+    print(f"📊 Total Qs    : {total}")
+
+    return {"MRR": mrr, "P@1": p_at_1, f"Recall@{top_k}": recall_k}
+
+
+## Sequential Encoders
+def rerank_single_query_topk(
+    query, 
+    candidate_doc_list, 
+    cross_encoder,
+    docs_content, 
+    batch_size=64,
+    top_k=20,
+):
+    cross_inputs = [(query, docs_content[doc_id]) for doc_id in candidate_doc_list]
+
+    scores = []
+    cross_encoder.model.eval()
+    with torch.no_grad():
+        for start_idx in range(0, len(cross_inputs), batch_size):
+            batch = cross_inputs[start_idx:start_idx + batch_size]
+            batch_scores = cross_encoder.predict(batch)
+            scores.extend(batch_scores)
+    
+    # Rerank documents based on scores
+    scores = np.array(scores)
+    sorted_idx = np.argsort(-scores)  # descending order
+    
+    # Select top-k
+    topk_idx = sorted_idx[:top_k]
+    topk_docs = [candidate_doc_list[i] for i in topk_idx]
+    
+    return topk_docs
+
+## For FAISS Recall calculation (Experimenting)
+def evaluate_faiss_only(
+    faiss_index,
+    faiss_doc_ids,
+    doc_contents,
+    retrieval_model,
+    questions_path,
+    top_k=500
+):
+    # Load QA pairs
+    with open(questions_path, 'r', encoding='utf-8') as f:
+        lines = [l.strip() for l in f if l.strip()]
+    qa_pairs = []
+    for i in range(0, len(lines), 3):
+        qa_pairs.append({
+            "question": lines[i+1],
+            "answer": lines[i+2].lower()
+        })
+    
+    correct = 0
+    mrr = 0
+    for idx, qa in enumerate(qa_pairs, 1):
+        # Encode query
+        q_emb = retrieval_model.encode([qa["question"]], convert_to_numpy=True)
+        faiss.normalize_L2(q_emb)
+        D, I = faiss_index.search(q_emb, top_k)
+        faiss_hits = [faiss_doc_ids[i] for i in I[0]]
+        
+        # Check if answer appears
+        text_hits = (doc_contents[did].lower() for did in faiss_hits)
+        found = False
+        for rank, doc in enumerate(text_hits, start=1):
+            if qa["answer"] in doc:
+                correct += 1
+                mrr += 1 / rank
+                print(f"✅ {correct}/{idx} (Rank: {rank})")
+                found = True
+                break
+        
+        if not found:
+            print(f"❌ {correct}/{idx} (Rank: --)")
+    
+    recall = correct / len(qa_pairs)
+    print(f"\n📈 FAISS Recall@{top_k}: {recall:.2%}")
+    print(f"📈 FAISS MRR@{top_k}: {mrr / len(qa_pairs):.4f}")
+    return recall
