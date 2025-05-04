@@ -4,6 +4,11 @@
 # Ignore text files
 README.txt
 questions.txt
+*.pkl
+*.npy
+*.faiss
+*.zip
+*.png
 
 # Ignore folders
 database/
