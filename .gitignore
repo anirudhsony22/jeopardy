@@ -8,3 +8,8 @@ questions.txt
 # Ignore folders
 database/
 wikidata/
+engine/
+jeopardyenv/
+structured/
+experiment/
+report/
