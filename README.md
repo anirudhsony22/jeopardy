@@ -21,6 +21,9 @@
 5. Merging
 6. Re-ranking
 
+ ![Pipeline Optimized](https://drive.google.com/file/d/1aY0dGBn_j_slWIhBEPjTS4Zby28CgdZq/view?usp=sharing)
+ ![Pipeline Old](https://drive.google.com/file/d/1dr43CGHaHrbiSJdre1fjeeUZeFBF3Nd5/view?usp=sharing)
+
 ## ⚠️ Notes
 
 - Index files are **not included** in this repository due to storage constraints.
